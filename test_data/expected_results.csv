@@ -1,0 +1,19 @@
+row_file,vendor_or_record,what_it_tests,expected_on_upload,expected_after_check
+vendors 1,Shivalik Softlabs Private Limited,Clean vendor with matching registry record,OK,HOLD (~67) in GST-only mode; officer signs off
+vendors 2,Narmada Infotech Private Limited,Clean vendor - but its GSTIN is reused by row 9,OK,HOLD (gstin_reused red flag)
+vendors 3,Brahmaputra Digital Services Private Limited,GST registration CANCELLED in registry,Warning,REJECT (knockout: GST cancelled)
+vendors 4,Chambal Data Systems Private Limited,GSTIN with wrong check digit,Warning (imported on purpose),REJECT (knockout: invalid GSTIN)
+vendors 5,Kaveri Cloud Solutions Private Limited,Declared PAN differs from PAN inside GSTIN,Warning,REJECT (knockout: PAN mismatch)
+vendors 6,Mahanadi Networks Private Limited,GSTIN is registered to a different firm (Sri Lakshmi Traders),Warning,HOLD (name mismatch flagged; NOT a knockout on the dashboard - known gap)
+vendors 7,Godavari Tech Private Limited,Same PAN as row 8 on the same tender (cover bidding),OK,REJECT (knockout: shared PAN on same tender)
+vendors 8,Tapti Systems Private Limited,Same PAN as row 7 on the same tender (cover bidding),OK,REJECT (knockout: shared PAN on same tender)
+vendors 9,Sabarmati IT Services Private Limited,Uses Narmada's GSTIN under another name,Warning,HOLD (gstin_reused red flag + name mismatch; NOT a knockout - known gap)
+vendors 10,Pench Solutions Private Limited,Irregular filer: only 4 of 12 GSTR-3B returns,OK,HOLD (low GST score)
+vendors 11,Teesta Technologies Private Limited,No GSTIN given,Warning,HOLD (GST checks skipped)
+vendors 12,Shivalik Softlabs Private Limited (again),Duplicate of row 1,Warning (merged),-
+vendors 13,Luni Systems Private Limited,Shell-company pattern: 6 staff vs Rs 90 cr turnover and Rs 45 cr tender,OK,HOLD in GST-only mode (shell signal needs live Crustdata headcount - fictional firm has none)
+vendors 14,Bad Value Infotech Private Limited,Text in a number column (tender value 'forty lakh'),BLOCKED,-
+registry 10,Zeta Wrong Digit Private Limited,Registry GSTIN with wrong check digit,BLOCKED,-
+registry 11,Future Date Private Limited,Registration date in the future (2031),BLOCKED,-
+registry 12,Over Filed Private Limited,GSTR-3B filed = 15 (more than 12),BLOCKED,-
+registry 13,Text Number Private Limited,GSTR-3B filed = 'twelve' (not a number),BLOCKED,-
