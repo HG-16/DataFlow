@@ -89,22 +89,36 @@ class BudgetExceeded(BaseException):
 class Crust:
     """Budgeted, cached Crustdata client. Re-runs hit the SQLite cache and cost nothing."""
 
-    def __init__(self, key: str, max_credits=MAX_CREDITS, max_seconds=MAX_SECONDS, db="cache.db"):
-        import httpx  # local import so tests can run without network deps
+    def __init__(self, key: str, max_credits=MAX_CREDITS, max_seconds=MAX_SECONDS, db="cache.db",
+                 replay: str | None = None):
+        self.offline = replay is not None
+        if not self.offline:
+            import httpx  # local import so replay/tests run without network deps
 
-        self.http = httpx.Client(timeout=60)
+            self.http = httpx.Client(timeout=60)
         self.hdrs = {"authorization": f"Bearer {key}", "x-api-version": API_VERSION,
                      "content-type": "application/json"}
         self.max_credits, self.deadline, self.spent = max_credits, time.time() + max_seconds, 0.0
         self.db = sqlite3.connect(db)
         self.db.execute("create table if not exists cache(k text primary key, v text)")
         self.db.execute("create table if not exists ledger(ts real, path text, credits real)")
+        if replay:  # preload recorded real responses under the exact cache keys the checks will ask for
+            for call in json.load(open(replay))["calls"]:
+                self.db.execute("insert or replace into cache values(?,?)",
+                                (self._key(call["path"], call["body"]), json.dumps(call["response"])))
+            self.db.commit()
+
+    @staticmethod
+    def _key(path: str, body: dict) -> str:
+        return hashlib.sha256((path + json.dumps(body, sort_keys=True)).encode()).hexdigest()
 
     def post(self, path: str, body: dict, est_cost: float = 1.0):
-        k = hashlib.sha256((path + json.dumps(body, sort_keys=True)).encode()).hexdigest()
+        k = self._key(path, body)
         row = self.db.execute("select v from cache where k=?", (k,)).fetchone()
         if row:
             return json.loads(row[0])
+        if self.offline:
+            raise RuntimeError(f"{path}: not in replay file (offline mode)")
         if time.time() > self.deadline or self.spent + est_cost > self.max_credits:
             raise BudgetExceeded(f"spent {self.spent:.1f} credits")
         for attempt in range(4):
@@ -115,7 +129,7 @@ class Crust:
         if r.status_code >= 400:
             raise RuntimeError(f"{path} -> HTTP {r.status_code}: {r.text[:300]}")
         data = r.json()
-        cost = _num(dig(data, "credits_used", "credits", "cost")) or est_cost
+        cost = _num(dig(data, "spent_this_call")) or est_cost   # API reports credits.spent_this_call
         self.spent += cost
         self.db.execute("insert into ledger values(?,?,?)", (time.time(), path, cost))
         self.db.execute("insert or replace into cache values(?,?)", (k, json.dumps(data)))
@@ -184,95 +198,131 @@ def snippet_of(r: dict) -> str:
     return str(r.get("snippet") or r.get("description") or r.get("content") or r.get("text") or "")[:400]
 
 
+def mentions(subject: str, text: str) -> bool:
+    """Strict check that `text` names `subject`: every distinctive word of the subject appears as a
+    whole word (fuzzy matching would let 'Ksolves' match 'resolves')."""
+    toks = norm_name(subject).split() or re.sub(r"[^a-z0-9 ]", " ", subject.lower()).split()
+    words = set(re.sub(r"[^a-z0-9 ]", " ", (text or "").lower()).split())
+    return bool(toks) and all(t in words for t in toks)
+
+
 def web_search(c: Crust, query: str, rep: Report, **extra):
-    body = {"query": query, **extra}
+    """/web/search/live -> {results: [{title, url, snippet, position, source}], ...}"""
+    body = {"query": query, "sources": ["web"], "location": "IN", **extra}
     data = c.post("/web/search/live", body, est_cost=1)
-    return records(data, "results", "data", "items")
+    return [r for r in (data.get("results") or []) if isinstance(r, dict)] if isinstance(data, dict) else []
+
+
+def company_matches(data) -> list[tuple[float, dict]]:
+    """identify/enrich -> [{matched_on, match_type, matches: [{confidence_score, company_data}]}]"""
+    out = []
+    for block in data if isinstance(data, list) else [data]:
+        for m in (block or {}).get("matches") or []:
+            if m.get("company_data"):
+                out.append((float(m.get("confidence_score") or 0), m["company_data"]))
+    return out
 
 
 # --------------------------------------------------------------------------- 1. identity
 def check_identity(c: Crust, bid: dict, rep: Report) -> dict | None:
+    """Returns the resolved company_data (crustdata_company_id + basic_info) or None."""
     dom, name = domain_root(bid.get("domain", "")), bid["vendor_name"]
+    src = "crustdata:/company/identify"
     company = None
     try:
-        data = c.post("/company/identify", {"domains": [dom]}, est_cost=0)
-        company = (records(data, "results", "data", "matches", "companies") or [None])[0]
+        ms = company_matches(c.post("/company/identify", {"domains": [dom]}, est_cost=0.2))
+        company = ms[0][1] if ms else None
     except Exception as e:  # noqa: BLE001
-        rep.add("identity", "domain_lookup", CANT_VERIFY, None, f"identify failed: {e}", "crustdata:/company/identify")
+        rep.add("identity", "domain_lookup", CANT_VERIFY, None, f"identify failed: {e}", src)
 
     if company:
-        real_name = dig(company, "name", "company_name") or ""
-        sim = name_sim(name, real_name)
-        if sim >= 85:
-            rep.add("identity", "domain_owner", CONFIRMED, 1.0,
-                    f"{dom} belongs to '{real_name}' (match {sim:.0f}%)", "crustdata:/company/identify",
-                    passage=real_name)
-        else:
-            rep.add("identity", "domain_owner", CONTRADICTED, 0.0,
-                    f"{dom} belongs to '{real_name}', not '{name}' (match {sim:.0f}%)",
-                    "crustdata:/company/identify", passage=real_name)
-    else:
-        rep.add("identity", "domain_owner", CANT_VERIFY, None, f"No company record for {dom}",
-                "crustdata:/company/identify")
-
-    # Lookalike check: who does the *name* resolve to? If a well-known firm with the same name
-    # owns a different, similar-looking domain, the bid domain is likely an impersonation.
-    try:
-        data = c.post("/company/identify", {"names": [name]}, est_cost=0)
-        for m in records(data, "results", "data", "matches", "companies")[:5]:
-            mdom = domain_root(dig(m, "primary_domain", "domain", "website") or "")
-            if not mdom or mdom == dom:
-                continue
+        bi = company.get("basic_info") or {}
+        real_name = bi.get("name") or ""
+        owned = {domain_root(d) for d in [bi.get("primary_domain")] + (bi.get("all_domains") or []) if d}
+        # Live finding: domain identify is fuzzy - 'ksolves.co' resolves to Ksolves (ksolves.com) at
+        # confidence 1.0. So the bid domain must literally be one of the matched firm's domains.
+        if owned and dom not in owned:
             from rapidfuzz import fuzz
 
+            real = domain_root(bi.get("primary_domain") or sorted(owned)[0])
+            dsim = fuzz.ratio(real.split(".")[0], dom.split(".")[0])
+            rep.add("identity", "lookalike_domain", RED_FLAG, 0.0,
+                    f"Bid domain {dom} is NOT owned by '{real_name}' (real domain: {real}, similarity {dsim:.0f}%)",
+                    bi.get("professional_network_url") or src, passage=", ".join(sorted(owned)),
+                    knockout=name_sim(name, real_name) >= 85 or dsim >= 70)
+            return company
+        sim = name_sim(name, real_name)
+        status = CONFIRMED if sim >= 85 else CONTRADICTED
+        rep.add("identity", "domain_owner", status, 1.0 if sim >= 85 else 0.0,
+                f"{dom} belongs to '{real_name}'" + ("" if sim >= 85 else f", not '{name}'") + f" (match {sim:.0f}%)",
+                bi.get("professional_network_url") or src, passage=real_name)
+    else:
+        rep.add("identity", "domain_owner", CANT_VERIFY, None, f"No company record for {dom}", src)
+
+    # Lookalike check: resolve the *name*. If a confident match with the same name owns a different
+    # but similar-looking domain, the bid's domain is likely an impersonation.
+    try:
+        from rapidfuzz import fuzz
+
+        for conf, m in company_matches(c.post("/company/identify", {"names": [name]}, est_cost=0.2)):
+            bi = m.get("basic_info") or {}
+            doms = {domain_root(d) for d in ([bi.get("primary_domain")] + (bi.get("all_domains") or [])) if d}
+            if conf < 0.75 or not doms or dom in doms or name_sim(name, bi.get("name") or "") < 85:
+                continue
+            mdom = domain_root(bi.get("primary_domain") or sorted(doms)[0])
             dsim = fuzz.ratio(mdom.split(".")[0], dom.split(".")[0])
-            nsim = name_sim(name, dig(m, "name", "company_name") or "")
-            if nsim >= 85 and dsim >= 70:
+            if dsim >= 70:
                 rep.add("identity", "lookalike_domain", RED_FLAG, 0.0,
-                        f"'{name}' is registered on {mdom}; bid uses lookalike {dom} (similarity {dsim:.0f}%)",
-                        "crustdata:/company/identify", passage=mdom, knockout=True)
-                return company
-    except Exception:  # noqa: BLE001 - fallback key may differ by API version
+                        f"'{bi.get('name')}' is registered on {mdom}; bid uses lookalike {dom} (similarity {dsim:.0f}%)",
+                        src, passage=mdom, knockout=True)
+                return company or m      # use the real firm's record for the remaining checks
+    except Exception:  # noqa: BLE001
         pass
     return company
 
 
 # --------------------------------------------------------------------------- 2. capacity
-def check_capacity(c: Crust, bid: dict, rep: Report, company: dict | None):
-    dom = domain_root(bid.get("domain", ""))
-    try:
-        data = c.post("/company/enrich", {"domains": [dom], "fields": ["basic_info", "headcount", "locations"]},
-                      est_cost=3)
-    except Exception as e:  # noqa: BLE001
-        rep.add("capacity", "enrich", CANT_VERIFY, None, f"enrich failed: {e}", "crustdata:/company/enrich")
-        return
-    hc = _num(dig(data, "total", "headcount_total", "employee_count", "linkedin_headcount"))
-    founded = _num(dig(data, "year_founded", "founded_year", "founded"))
-    asof = str(dig(data, "last_updated", "updated_at") or dt.date.today())
+def check_capacity(c: Crust, bid: dict, rep: Report, company: dict | None) -> dict:
+    """Returns the enriched company_data (incl. people.cxos/founders/decision_makers) for later checks."""
     src = "crustdata:/company/enrich"
+    body = {"fields": ["basic_info", "headcount", "hiring", "people"]}
+    if company and company.get("crustdata_company_id"):
+        body["crustdata_company_ids"] = [company["crustdata_company_id"]]
+    else:
+        body["domains"] = [domain_root(bid.get("domain", ""))]
+    try:
+        ms = company_matches(c.post("/company/enrich", body, est_cost=4))
+    except Exception as e:  # noqa: BLE001
+        rep.add("capacity", "enrich", CANT_VERIFY, None, f"enrich failed: {e}", src)
+        return {}
+    if not ms:
+        rep.add("capacity", "headcount", CANT_VERIFY, None, "No company profile found", src)
+        return {}
+    cd = ms[0][1]
+    bi, hcd = cd.get("basic_info") or {}, cd.get("headcount") or {}
+    hc = _num(hcd.get("total"))
+    founded = _num(bi.get("year_founded"))
+    asof = str(dt.date.today())
 
     claimed_hc = _num(bid.get("claimed_headcount"))
     if hc is not None and claimed_hc:
         ratio = hc / claimed_hc
-        if ratio >= 0.5:
-            rep.add("capacity", "headcount", CONFIRMED, min(1.0, ratio), f"Claimed {claimed_hc:.0f}, observed {hc:.0f}",
-                    src, passage=f"headcount={hc:.0f}", date=asof)
-        else:
-            rep.add("capacity", "headcount", CONTRADICTED, ratio,
-                    f"Claimed {claimed_hc:.0f} staff but only {hc:.0f} observed ({ratio:.0%})",
-                    src, passage=f"headcount={hc:.0f}", date=asof)
+        ok = ratio >= 0.5
+        rep.add("capacity", "headcount", CONFIRMED if ok else CONTRADICTED, min(1.0, ratio),
+                f"Claimed {claimed_hc:.0f}, observed {hc:.0f}" + ("" if ok else f" ({ratio:.0%}) - inflated"),
+                src, passage=f"headcount.total={hc:.0f}", date=asof)
+    elif hc is not None:
+        rep.add("capacity", "headcount", CONFIRMED, 1.0 if hc >= 50 else 0.6, f"Observed headcount {hc:.0f}", src,
+                passage=f"headcount.total={hc:.0f}", date=asof)
     else:
         rep.add("capacity", "headcount", CANT_VERIFY, None, "Headcount not available", src)
 
     claimed_yr = _num(bid.get("claimed_year_founded"))
     if founded and claimed_yr:
-        if abs(founded - claimed_yr) <= 1:
-            rep.add("capacity", "founded", CONFIRMED, 1.0, f"Founded {founded:.0f} (claimed {claimed_yr:.0f})", src,
-                    passage=f"year_founded={founded:.0f}")
-        else:
-            rep.add("capacity", "founded", CONTRADICTED, 0.0,
-                    f"Claimed founded {claimed_yr:.0f}, records show {founded:.0f}", src,
-                    passage=f"year_founded={founded:.0f}")
+        ok = abs(founded - claimed_yr) <= 1
+        rep.add("capacity", "founded", CONFIRMED if ok else CONTRADICTED, 1.0 if ok else 0.0,
+                f"Founded {founded:.0f}" + (f" (claimed {claimed_yr:.0f})" if ok else f", bid claims {claimed_yr:.0f}"),
+                src, passage=f"basic_info.year_founded={founded:.0f}")
 
     # Shell-company signal: tiny team vs big tender / big claimed turnover.
     tv = _num((bid.get("tender") or {}).get("value_inr"))
@@ -281,28 +331,28 @@ def check_capacity(c: Crust, bid: dict, rep: Report, company: dict | None):
         if tv and tv / max(hc, 1) > 2.5e7:  # > ₹2.5 cr of contract per observed employee
             rep.add("capacity", "shell_signal_tender", RED_FLAG, 0.1,
                     f"Tender ₹{tv/1e7:.1f} cr vs {hc:.0f} staff = ₹{tv/max(hc,1)/1e7:.1f} cr per head", src,
-                    passage=f"headcount={hc:.0f}")
+                    passage=f"headcount.total={hc:.0f}")
         if turnover and turnover / max(hc, 1) > 1.5e7:  # IT services ~₹10-40 lakh revenue / employee
             rep.add("capacity", "shell_signal_turnover", RED_FLAG, 0.1,
                     f"Claimed turnover ₹{turnover/1e7:.1f} cr with {hc:.0f} staff "
                     f"(₹{turnover/max(hc,1)/1e5:.0f} lakh/head; IT norm is ₹10–40 lakh)", src)
 
-    # Hiring signal: a firm bidding on a large build usually has open roles.
-    name = dig(company or {}, "name", "company_name") or bid["vendor_name"]
-    try:
-        jobs = c.post("/job/search", {
-            "filters": {"op": "and", "conditions": [
-                {"field": "company.basic_info.name", "type": "in", "value": [name]}]},
-            "limit": 5}, est_cost=0.15)
-        n = len(records(jobs, "jobs", "results", "data"))
-        total = _num(dig(jobs, "total_count", "total")) or n
-        if total:
-            rep.add("capacity", "hiring", CONFIRMED, 1.0, f"{total:.0f} open job listings found", "crustdata:/job/search")
-        elif tv and tv >= 5e7:
-            rep.add("capacity", "hiring", CONTRADICTED, 0.3,
-                    f"No open roles despite bidding ₹{tv/1e7:.1f} cr build", "crustdata:/job/search")
-    except Exception:  # noqa: BLE001
-        pass
+    # Hiring signal (count-only job search is free).
+    cid = cd.get("crustdata_company_id") or (company or {}).get("crustdata_company_id")
+    if cid:
+        try:
+            jobs = c.post("/job/search", {"filters": {"field": "company.basic_info.crustdata_company_id",
+                                                      "type": "=", "value": cid},
+                                          "aggregations": [{"type": "count"}], "limit": 0}, est_cost=0)
+            total = _num(jobs.get("total_count")) if isinstance(jobs, dict) else None
+            if total:
+                rep.add("capacity", "hiring", CONFIRMED, 1.0, f"{total:.0f} job listings on record", "crustdata:/job/search")
+            elif total == 0 and tv and tv >= 5e7:
+                rep.add("capacity", "hiring", CONTRADICTED, 0.3,
+                        f"No job listings despite bidding a ₹{tv/1e7:.1f} cr build", "crustdata:/job/search")
+        except Exception:  # noqa: BLE001
+            pass
+    return cd
 
 
 # --------------------------------------------------------------------------- 3. GST
@@ -375,7 +425,7 @@ def check_gst(c: Crust | None, bid: dict, rep: Report):
                 m = re.search(r"\b(active|cancelled|canceled|suspended|inactive)\b", low)
                 if m:
                     status, src, passage = m.group(1), r.get("url", "web"), snippet_of(r)
-                    if bid["vendor_name"] and name_sim(bid["vendor_name"], text) < 60:
+                    if bid["vendor_name"] and not mentions(bid["vendor_name"], text):
                         rep.add("gst", "gst_legal_name", CONTRADICTED, 0.2,
                                 "Public GSTIN record does not mention the vendor's name", src, passage)
                     break
@@ -421,39 +471,41 @@ LEGAL_QUERY = ('(fraud OR cheating OR blacklisted OR debarred OR insolvency OR N
 
 
 def legal_scan(c: Crust, subject: str, context: str, category: str, rep: Report, label: str):
-    """Search court records (Indian Kanoon, eCourts mirrors) + news for cases naming `subject`."""
+    """Search court records (Indian Kanoon) + web/news for cases naming `subject`.
+    For a person, `context` is the firm's short name and must also appear (namesake guard)."""
     hits, seen = [], set()
+    ctx = f' "{context}"' if context else ""
     queries = [
-        (" ".join(x for x in (f'"{subject}"', context and f'"{context}"', "site:indiankanoon.org") if x), "court"),
-        (" ".join(x for x in (f'"{subject}"', context and f'"{context}"', LEGAL_QUERY) if x), "news"),
+        (f'"{subject}"{ctx}', {"site": "indiankanoon.org"}, "court"),
+        (f'"{subject}"{ctx} {LEGAL_QUERY}', {}, "news"),
     ]
-    for q, kind in queries:
+    for q, extra, kind in queries:
         try:
-            results = web_search(c, q, rep)
+            results = web_search(c, q, rep, **extra)
         except BudgetExceeded:
             raise
         except Exception as e:  # noqa: BLE001
             rep.add(category, f"{label}_search", CANT_VERIFY, None, f"search failed: {e}")
             continue
-        for r in results[:8]:
+        for r in results[:10]:
             url = r.get("url", "")
             if url in seen:
                 continue
             seen.add(url)
             text = f"{r.get('title', '')} {snippet_of(r)}"
-            # Must actually name the subject (guards against namesakes and generic pages).
-            if name_sim(subject, text) < 85 or (context and kind == "news" and name_sim(context, text) < 60
-                                                 and category == "people_legal"):
+            # The snippet itself must name the subject (and the firm, for a person). Search engines
+            # return lots of generic NCLT cause lists etc. that never mention the subject.
+            if not mentions(subject, text) or (context and not mentions(context, text)):
                 continue
             for rx, sev, s, ko in LEGAL_TERMS:
                 if rx.search(text):
-                    hits.append((sev, s, ko, url, snippet_of(r), str(r.get("date") or r.get("published_date") or "")))
+                    hits.append((sev, s, ko, url, snippet_of(r), str(r.get("date") or "")))
                     break
     if not hits:
         # Absence of hits is weaker evidence than a clean certificate: cap at 0.85.
         rep.add(category, f"{label}_cases", CONFIRMED, 0.85,
-                f"No cases / adverse records found naming {subject} (web search can miss sealed or "
-                f"unindexed matters - confirm on ecourts.gov.in)", "web: indiankanoon.org + news")
+                f"No cases / adverse records found naming {subject} (web search can miss unindexed "
+                f"matters - confirm on ecourts.gov.in)", "crustdata:/web/search/live (indiankanoon.org + web)")
         return
     hits.sort(key=lambda h: h[1])
     for sev, s, ko, url, snip, date in hits[:3]:
@@ -472,59 +524,91 @@ def check_firm_legal(c: Crust, bid: dict, rep: Report):
 
 
 # --------------------------------------------------------------------------- 5. people
-def check_people(c: Crust, bid: dict, rep: Report, company: dict | None):
-    vendor = dig(company or {}, "name", "company_name") or bid["vendor_name"]
-    people = bid.get("key_personnel") or []
+def _jobs(profile: dict, when: str) -> list[dict]:
+    j = ((profile.get("experience") or {}).get("employment_details") or {}).get(when) or []
+    return j if isinstance(j, list) else [j]
+
+
+def _employer(job: dict) -> str:
+    return str(job.get("name") or job.get("employer_name") or job.get("company_name") or "")
+
+
+def _url(profile: dict) -> str:
+    return str((((profile.get("social_handles") or {}).get("professional_network_identifier") or {})
+                .get("profile_url")) or "")
+
+
+def _pname(profile: dict) -> str:
+    return str((profile.get("basic_profile") or {}).get("name") or "").strip()
+
+
+def check_people(c: Crust, bid: dict, rep: Report, company: dict | None, enriched: dict | None = None):
+    enriched = enriched or {}
+    vendor = ((enriched.get("basic_info") or (company or {}).get("basic_info") or {}).get("name")) or bid["vendor_name"]
+    short = norm_name(vendor) or vendor
+    leaders = []
+    for grp in ("founders", "cxos", "decision_makers"):
+        leaders += [p for p in ((enriched.get("people") or {}).get(grp) or []) if isinstance(p, dict)]
+
+    people = list(bid.get("key_personnel") or [])
     if not people:
-        rep.add("people", "key_personnel", CANT_VERIFY, None, "No key personnel listed")
-        return
+        # Nobody named in the bid: check the firm's own leadership from Crustdata instead.
+        auto = [p for p in leaders if any(name_sim(vendor, _employer(j)) >= 85 for j in _jobs(p, "current"))]
+        people = [{"name": _pname(p), "title": "leadership (auto)"} for p in auto[:3] if _pname(p)]
+        if people:
+            rep.add("people", "key_personnel", CANT_VERIFY, None,
+                    f"Bid names no key personnel; checking firm leadership instead: "
+                    f"{', '.join(p['name'] for p in people)}", "crustdata:/company/enrich people")
+        else:
+            rep.add("people", "key_personnel", CANT_VERIFY, None, "No key personnel listed or found")
+            return
+
     for p in people[:5]:
-        nm = p["name"]
-        try:
-            data = c.post("/person/search", {
-                "filters": {"op": "and", "conditions": [
-                    {"field": "basic_profile.name", "type": "(.)", "value": nm}]},
-                "fields": ["basic_profile.name", "basic_profile.linkedin_url", "basic_profile.last_updated",
-                           "experience.employment_details.current.company_name",
-                           "experience.employment_details.current.title",
-                           "experience.employment_details.past.company_name",
-                           "experience.employment_details.past.end_date"],
-                "limit": 10}, est_cost=0.3)
-        except BudgetExceeded:
-            raise
-        except Exception as e:  # noqa: BLE001
-            rep.add("people", f"person:{nm}", CANT_VERIFY, None, f"search failed: {e}")
-            continue
-        cands = [x for x in records(data, "profiles", "results", "data", "people")
-                 if name_sim(nm, str(dig(x, "name") or "")) >= 85]
-        current, past = None, None
-        for x in cands:
-            cur = dig(x, "current")
-            pst = dig(x, "past")
-            cur_names = [str(dig(j, "company_name") or "") for j in (cur if isinstance(cur, list) else [cur or {}])]
-            pst_names = [str(dig(j, "company_name") or "") for j in (pst if isinstance(pst, list) else [pst or {}])]
-            if any(name_sim(vendor, n) >= 85 for n in cur_names):
-                current = x
-                break
-            if any(name_sim(vendor, n) >= 85 for n in pst_names):
-                past = x
-        src = "crustdata:/person/search"
+        nm, src = p["name"], "crustdata:/person/search"
+        # 1) free cross-check against the enriched leadership list
+        cands = [x for x in leaders if name_sim(nm, _pname(x)) >= 90]
+        # 2) otherwise a person search on the name
+        if not any(any(name_sim(vendor, _employer(j)) >= 85 for j in _jobs(x, "current")) for x in cands):
+            try:
+                data = c.post("/person/search", {
+                    "filters": {"op": "and", "conditions": [
+                        {"field": "basic_profile.name", "type": "(.)", "value": nm}]},
+                    "fields": ["basic_profile.name", "basic_profile.headline",
+                               "social_handles.professional_network_identifier.profile_url",
+                               "experience.employment_details.current.name",
+                               "experience.employment_details.current.title",
+                               "experience.employment_details.past.name",
+                               "experience.employment_details.past.end_date"],
+                    "limit": 10}, est_cost=0.7)
+                cands += [x for x in (data.get("profiles") or []) if name_sim(nm, _pname(x)) >= 90]
+            except BudgetExceeded:
+                raise
+            except Exception as e:  # noqa: BLE001
+                rep.add("people", f"person:{nm}", CANT_VERIFY, None, f"search failed: {e}", src)
+                continue
+        else:
+            src = "crustdata:/company/enrich people"
+
+        current = next((x for x in cands if any(name_sim(vendor, _employer(j)) >= 85 for j in _jobs(x, "current"))), None)
+        past = next((x for x in cands if any(name_sim(vendor, _employer(j)) >= 85 for j in _jobs(x, "past"))), None)
         if current:
-            title = str(dig(current, "title") or "")
-            rep.add("people", f"person:{nm}", CONFIRMED, 1.0, f"{nm} currently at {vendor} as '{title}'", src,
-                    passage=str(dig(current, "linkedin_url") or ""), date=str(dig(current, "last_updated") or ""))
+            job = next(j for j in _jobs(current, "current") if name_sim(vendor, _employer(j)) >= 85)
+            title = job.get("title") or job.get("employee_title") or ""
+            claimed = p.get("title") or ""
+            rep.add("people", f"person:{nm}", CONFIRMED, 1.0,
+                    f"{nm} currently at {vendor} as '{title}'" + (f" (bid says '{claimed}')" if claimed else ""),
+                    src, passage=_url(current), date=str(current.get("updated_at") or ""))
         elif past:
-            now = [str(dig(j, "company_name")) for j in (dig(past, "current") or []) if isinstance(j, dict)]
+            now = ", ".join(_employer(j) for j in _jobs(past, "current") if _employer(j)) or "unknown"
             rep.add("people", f"person:{nm}", CONTRADICTED, 0.0,
-                    f"{nm} LEFT {vendor}; now at {', '.join(now) or 'unknown'} - name used without being on staff",
-                    src, passage=str(dig(past, "linkedin_url") or ""))
+                    f"{nm} has LEFT {vendor}; now at {now} - name used without being on staff", src, passage=_url(past))
         elif cands:
             rep.add("people", f"person:{nm}", CANT_VERIFY, 0.4,
                     f"{len(cands)} people named {nm} found, none linked to {vendor} (namesake risk)", src)
         else:
             rep.add("people", f"person:{nm}", CANT_VERIFY, None, f"No public profile for {nm}", src)
 
-        legal_scan(c, nm, norm_name(vendor), "people_legal", rep, f"person:{nm}")
+        legal_scan(c, nm, short, "people_legal", rep, f"person:{nm}")
 
 
 # --------------------------------------------------------------------------- scoring
@@ -602,10 +686,10 @@ def run(bid: dict, client: Crust) -> tuple[Report, dict]:
     company = None
     try:
         company = check_identity(client, bid, rep)
-        check_capacity(client, bid, rep, company)
+        enriched = check_capacity(client, bid, rep, company)
         check_gst(client, bid, rep)
         check_firm_legal(client, bid, rep)
-        check_people(client, bid, rep, company)
+        check_people(client, bid, rep, company, enriched)
     except BudgetExceeded as e:
         rep.add("identity", "budget", CANT_VERIFY, None, f"Stopped early: budget hit ({e}); remaining checks skipped")
     rep.credits_spent = getattr(client, "spent", 0.0)
@@ -639,10 +723,14 @@ def main(argv=None):
     ap.add_argument("--no-prompt", action="store_true", help="don't ask for missing details")
     ap.add_argument("--yes", action="store_true", help="skip human confirmation of REJECT (demo)")
     ap.add_argument("--out", default="report.json")
+    ap.add_argument("--replay", metavar="FIXTURE", help="run offline on recorded API responses (e.g. fixtures/ksolves_live.json)")
     a = ap.parse_args(argv)
     bid = intake(json.load(open(a.bid)), interactive=not a.no_prompt and sys.stdin.isatty())
-    key = os.environ.get("CRUSTDATA_API_KEY") or sys.exit("set CRUSTDATA_API_KEY")
-    rep, s = run(bid, Crust(key))
+    if a.replay:
+        client = Crust("", db=":memory:", replay=a.replay)
+    else:
+        client = Crust(os.environ.get("CRUSTDATA_API_KEY") or sys.exit("set CRUSTDATA_API_KEY (or use --replay)"))
+    rep, s = run(bid, client)
     print_report(rep, s)
     if s["verdict"] == "REJECT" and not a.yes:
         ok = input("\nREJECT requires human sign-off. Confirm reject? [y/N] ").strip().lower() == "y"

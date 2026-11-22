@@ -53,6 +53,20 @@ Scoring notes:
 - Finding no case records scores 0.85, not 1.0, because a web search can miss cases.
 - Shell-company thresholds: over ₹2.5 cr of tender value per observed employee, or over ₹1.5 cr of claimed turnover per employee. The IT-services norm is about ₹10–40 lakh revenue per employee.
 
+## Live results (real Crustdata data, 22 Nov 2026)
+
+Run against **Ksolves India Limited** (NSE-listed IT services firm). Every response came from the live
+Crustdata API through the Crustdata MCP connector and is saved in `fixtures/ksolves_live.json`.
+
+| Bid | What the agent found | Verdict |
+|---|---|---|
+| `bids/ksolves.json`: genuine claims | ksolves.com is owned by Ksolves; 866 staff observed vs 600 claimed; founded 2012 ✓; 13 job listings; CEO Ratan Srivastava and CTO Manish Gurnani confirmed in post; no cases naming the firm or either person | **APPROVE 85.5** (GST not supplied, coverage 80%) |
+| `bids/ksolves_lookalike.json`: fake claims | **ksolves.co is not a Ksolves domain** (knockout); 2500 staff claimed vs 866 observed; founded 2005 claimed vs 2012; "Arjun Malhotra" matches 4 people, none at Ksolves | **REJECT** |
+
+Two problems the live data exposed, both now fixed and covered by tests:
+1. `/company/identify` matches domains fuzzily. It resolves `ksolves.co` to Ksolves at confidence 1.0, so the bid domain must literally appear in the matched firm's `all_domains`.
+2. Court and news searches mostly return generic NCLT cause lists that don't name the vendor. A hit counts only when its snippet names the subject in whole words (and also names the firm, for a person).
+
 ## Run
 
 ```bash
@@ -60,7 +74,8 @@ pip install httpx rapidfuzz
 export CRUSTDATA_API_KEY=...
 python gem_checker.py bids/bid_lookalike.json          # asks for missing GSTIN/PAN/people etc.
 python gem_checker.py bids/bid_honest.json --no-prompt --yes
-python -m pytest -q tests                              # offline, no credits
+python gem_checker.py bids/ksolves.json --replay fixtures/ksolves_live.json --no-prompt --yes   # real data, offline
+python -m pytest -q tests                              # offline, no credits (incl. real-data regressions)
 ```
 
 Bid JSON fields:
@@ -81,7 +96,7 @@ Safeguards:
 - **GST status and filings:** there's no free official API. The GST portal search has a CAPTCHA. The tool uses public web pages and values the reviewer enters from `services.gst.gov.in`. A GSP API (Masters India, ClearTax, Karza, etc.) can be plugged into `check_gst`.
 - **Court cases:** eCourts/NJDG has no open API. The tool searches Indian Kanoon and news through Crustdata web search, so unindexed district-court matters can be missed. The "no cases" result is labelled as such.
 - **Company data:** MCA financials and director DINs aren't in Crustdata. Director disqualification is detected only through public mentions.
-- **Untested responses:** the Crustdata response shapes in the tests are assumptions. The parser looks up fields by name wherever they appear (`dig`/`records`), but re-check the field names against the live API.
+- **Response formats:** checked against the live API (identify, enrich, person search, job search, web search). The script calls the REST API directly with the same request bodies the MCP connector uses.
 - **Test bids:** the files in `bids/` are synthetic. The firm and people are fictional.
 
 ## AI assistance
