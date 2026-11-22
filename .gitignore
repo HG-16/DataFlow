@@ -1,0 +1,4 @@
+cache.db
+report.json
+__pycache__/
+.env
